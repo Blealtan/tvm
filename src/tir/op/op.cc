@@ -943,7 +943,24 @@ PrimExpr isinf(PrimExpr x, Span span) {
 }
 
 // isfinite
-PrimExpr isfinite(PrimExpr x, Span span) { return !isinf(x, span) && !isnan(x, span); }
+PrimExpr isfinite(PrimExpr x, Span span) {
+  DataType t = DataType::Bool(x.dtype().lanes());
+  if (x.dtype().is_int() || x.dtype().is_uint()) {
+    return make_const(t, true, span);
+  } else if (x.dtype().is_float()) {
+    using tir::FloatImmNode;
+    const FloatImmNode* fx = x.as<FloatImmNode>();
+    if (fx) {
+      return make_const(t, std::isfinite(fx->value), fx->span);
+    }
+    if (x.dtype().bits() == 32 || x.dtype().bits() == 64) {
+      return tir::Call(t, builtin::isfinite(), {x}, {}, span);
+    }
+    return !isinf(x, span) && !isnan(x, span);
+  } else {
+    LOG(FATAL) << "Data type " << x.dtype() << " not supported for finiteness ops. Skipping it...";
+  }
+}
 
 PrimExpr sum(PrimExpr source, ffi::Array<IterVar> rdom, ffi::Array<PrimExpr> init, Span span) {
   Var x("x", source.dtype(), span), y("y", source.dtype(), span);

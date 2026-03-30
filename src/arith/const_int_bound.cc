@@ -33,6 +33,7 @@
 #include "int_operator.h"
 #include "pattern_match.h"
 #include "scalable_expression.h"
+#include "tvm/tir/op_attr_types.h"
 
 namespace tvm {
 namespace arith {
@@ -862,6 +863,9 @@ class ConstIntBoundAnalyzer::Impl
     };
 
     for (const auto& subexpr : ExtractConstraints(cond)) {
+      if(SideEffect(subexpr) > tir::CallEffectKind::kPure) {
+        continue;
+      }
       // NOTE: The canonical form always uses <= or <, but a
       // user-supplied constraint from the python API might not be
       // canonicalized.

@@ -43,6 +43,15 @@
 
 namespace tvm {
 namespace runtime {
+namespace {
+
+inline void EnsureCurrentDeviceContext(int device_id) {
+  // Driver API entry points require a current context on this thread. `cudaGetDevice`
+  // reports the logical device, but it does not guarantee the primary context is bound.
+  CUDA_CALL(cudaSetDevice(device_id));
+}
+
+}  // namespace
 
 // Module to support thread-safe multi-GPU execution.
 // cuModule is a per-GPU module
@@ -112,6 +121,7 @@ class CUDAModuleNode : public ffi::ModuleObj {
   // get a CUfunction from primary context in device_id
   CUfunction GetFunc(int device_id, const std::string& func_name) {
     std::lock_guard<std::mutex> lock(mutex_);
+    EnsureCurrentDeviceContext(device_id);
     // must recheck under the lock scope
     if (module_[device_id] == nullptr) {
       CUDA_DRIVER_CALL(cuModuleLoadData(&(module_[device_id]), data_.c_str()));
@@ -132,6 +142,7 @@ class CUDAModuleNode : public ffi::ModuleObj {
   // get a global var from primary context in device_id
   CUdeviceptr GetGlobal(int device_id, const std::string& global_name, size_t expect_nbytes) {
     std::lock_guard<std::mutex> lock(mutex_);
+    EnsureCurrentDeviceContext(device_id);
     // must recheck under the lock scope
     if (module_[device_id] == nullptr) {
       CUDA_DRIVER_CALL(cuModuleLoadData(&(module_[device_id]), data_.c_str()));
@@ -180,6 +191,8 @@ class CUDAWrappedFunc {
     std::fill(fcache_.begin(), fcache_.end(), nullptr);
     // Track whether this kernel uses dynamic shared memory and the last size set per device.
     std::fill(dyn_smem_initialized_.begin(), dyn_smem_initialized_.end(), false);
+    // Track whether cluster attribute has been set per device.
+    std::fill(cluster_attr_initialized_.begin(), cluster_attr_initialized_.end(), false);
     use_dyn_shared_memory_ = false;
     for (const auto& tag : launch_param_tags) {
       if (tag == launch_param::kUseDynamicSharedMemoryTag) {
@@ -193,6 +206,7 @@ class CUDAWrappedFunc {
   void operator()(ffi::PackedArgs args, ffi::Any* rv, void** void_args) const {
     int device_id;
     CUDA_CALL(cudaGetDevice(&device_id));
+    EnsureCurrentDeviceContext(device_id);
     ThreadWorkLoad wl = launch_param_config_.Extract(args);
 
     if (fcache_[device_id] == nullptr) {
@@ -219,7 +233,49 @@ class CUDAWrappedFunc {
     CUstream strm = static_cast<CUstream>(TVMFFIEnvGetStream(kDLCUDA, device_id));
     CUresult result;
 
-    if (launch_param_config_.use_programtic_dependent_launch()) {
+    ICHECK(wl.grid_dim(0) > 0 && wl.grid_dim(1) > 0 && wl.grid_dim(2) > 0)
+        << "CUDALaunch Error: grid dimension must be positive, but got"
+        << " grid=(" << wl.grid_dim(0) << "," << wl.grid_dim(1) << "," << wl.grid_dim(2) << ")"
+        << " in kernel " << func_name_
+        << ". A zero grid dimension is often caused by a dynamic shape"
+        << " (e.g. num_tokens) being 0 at runtime.";
+
+    if (wl.use_cluster_launch()) {
+      // SM90+ cluster launch
+      CUlaunchConfig config{};
+      CUlaunchAttribute attribute[2]{};
+      attribute[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+      attribute[0].value.clusterDim.x = wl.cluster_dim[0];
+      attribute[0].value.clusterDim.y = wl.cluster_dim[1];
+      attribute[0].value.clusterDim.z = wl.cluster_dim[2];
+      attribute[1].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+      attribute[1].value.programmaticStreamSerializationAllowed = 1;
+
+      config.attrs = attribute;
+      config.numAttrs = 2;
+      config.hStream = strm;
+      config.gridDimX = wl.grid_dim(0);
+      config.gridDimY = wl.grid_dim(1);
+      config.gridDimZ = wl.grid_dim(2);
+      config.blockDimX = wl.block_dim(0);
+      config.blockDimY = wl.block_dim(1);
+      config.blockDimZ = wl.block_dim(2);
+      config.sharedMemBytes = wl.dyn_shmem_size;
+
+      // Set non-portable cluster size allowed attribute
+      if (!cluster_attr_initialized_[device_id]) {
+        CUresult attr_result = cuFuncSetAttribute(
+            fcache_[device_id], CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1);
+        if (attr_result != CUDA_SUCCESS) {
+          const char* msg;
+          cuGetErrorName(attr_result, &msg);
+          LOG(FATAL) << "Failed to set cluster attribute for " << func_name_ << ": " << msg;
+        }
+        cluster_attr_initialized_[device_id] = true;
+      }
+
+      result = cuLaunchKernelEx(&config, fcache_[device_id], void_args, nullptr);
+    } else if (launch_param_config_.use_programtic_dependent_launch()) {
       CUlaunchConfig config{};
       CUlaunchAttribute attribute[1]{};
       attribute[0].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
@@ -284,6 +340,8 @@ class CUDAWrappedFunc {
   // Cached last dynamic shared memory size per device and whether it's initialized
   mutable std::array<size_t, kMaxNumGPUs> dyn_smem_last_;
   mutable std::array<bool, kMaxNumGPUs> dyn_smem_initialized_;
+  // Whether cluster attribute has been initialized per device
+  mutable std::array<bool, kMaxNumGPUs> cluster_attr_initialized_;
   // have pdl setting
   bool has_programmatic_dependent_launch_;
 };
@@ -297,6 +355,7 @@ class CUDAPrepGlobalBarrier {
   void operator()(const ffi::PackedArgs& args, ffi::Any* rv) const {
     int device_id;
     CUDA_CALL(cudaGetDevice(&device_id));
+    EnsureCurrentDeviceContext(device_id);
     if (pcache_[device_id] == 0) {
       pcache_[device_id] =
           m_->GetGlobal(device_id, runtime::symbol::tvm_global_barrier_state, sizeof(unsigned));

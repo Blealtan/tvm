@@ -154,6 +154,11 @@ TVM_DLL const Op& isnullptr();
 TVM_DLL const Op& isnan();
 
 /*!
+ * \brief Check if value is finite
+ */
+TVM_DLL const Op& isfinite();
+
+/*!
  * \brief Popcount
  */
 TVM_DLL const Op& popcount();

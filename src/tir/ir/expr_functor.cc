@@ -47,6 +47,13 @@ void ExprVisitor::VisitExpr_(const LetNode* op) {
 
 void ExprVisitor::VisitExpr_(const CallNode* op) {
   VisitArray(op->args, [this](const PrimExpr& e) { this->VisitExpr(e); });
+  // Also visit PrimExpr values inside annotations (e.g. barrier arguments
+  // stored as CallNode annotations by tile operators like tma_copy).
+  for (const auto& kv : op->annotations) {
+    if (auto opt = kv.second.as<PrimExpr>()) {
+      this->VisitExpr(opt.value());
+    }
+  }
 }
 
 #define DEFINE_BINOP_VISIT_(OP)                \
@@ -151,10 +158,26 @@ PrimExpr ExprMutator::VisitExpr_(const CallNode* op) {
   auto fmutate = [this](const PrimExpr& e) { return this->VisitExpr(e); };
   ffi::Array<PrimExpr> args = op->args.Map(fmutate);
 
-  if (args.same_as(op->args)) {
+  // Also mutate PrimExpr values inside annotations (e.g. barrier arguments
+  // stored as CallNode annotations by tile operators like tma_copy).
+  ffi::Map<ffi::String, ObjectRef> new_annotations;
+  bool annotations_changed = false;
+  for (const auto& kv : op->annotations) {
+    if (auto opt = kv.second.as<PrimExpr>()) {
+      PrimExpr new_val = this->VisitExpr(opt.value());
+      new_annotations.Set(kv.first, new_val);
+      if (!new_val.same_as(opt.value())) {
+        annotations_changed = true;
+      }
+    } else {
+      new_annotations.Set(kv.first, kv.second);
+    }
+  }
+
+  if (args.same_as(op->args) && !annotations_changed) {
     return ffi::GetRef<PrimExpr>(op);
   } else {
-    return Call(op->dtype, op->op, args, op->annotations);
+    return Call(op->dtype, op->op, args, annotations_changed ? new_annotations : op->annotations);
   }
 }
 

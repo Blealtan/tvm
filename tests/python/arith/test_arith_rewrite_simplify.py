@@ -941,6 +941,10 @@ class TestComparisons(BaseCompare):
         TestCase(x * 3 < y * 3, x < y),
         TestCase(x * (-3) < y * (-3), y < x),
         TestCase(x * 3 >= y * 3, y <= x),
+        # Eliminate bounded offset when comparing aligned values.
+        TestCase(x * 4 + y < z, x * 4 < z, [y >= 0, y < 4, flm(z, 4) == 0]),
+        TestCase(x * 4 + y >= z, z <= x * 4, [y >= 0, y < 4, flm(z, 4) == 0]),
+        TestCase(z < x * 4 + y, z <= x * 4, [y >= 1, y < 4, flm(z, 4) == 0]),
         TestCase(x * 4 >= 2, tvm.tir.LE(1, x)),
         TestCase(x * 2 >= 50, tvm.tir.LE(25, x)),
         TestCase(x * 4 <= 2, x <= 0),

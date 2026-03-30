@@ -27,6 +27,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include <algorithm>
 #include <tuple>
@@ -1951,6 +1952,109 @@ PrimExpr RewriteSimplifier::Impl::ApplyRewriteRules(LT ret) {
     TVM_TRY_RECURSIVE_REWRITE(x < c1 + y, x - y < c1);
     TVM_TRY_RECURSIVE_REWRITE(c1 + y < x, c1 < x - y);
 
+    // If (base + offset) is compared against a multiple of k, and `offset`
+    // is known to be in [0, k), then the comparison is equivalent to just
+    // comparing `base` against the multiple of k.
+    //
+    // Example:
+    //   tx * 4 + i < N  ==>  tx * 4 < N
+    // when 0 <= i < 4 and N % 4 == 0.
+    auto is_multiple_of = [&](PrimExpr expr, int64_t expr_gcd, int64_t factor) -> bool {
+      if (factor <= 1) return false;
+      if (expr_gcd % factor == 0) return true;
+
+      PrimExpr factor_expr = make_const(expr.dtype(), factor);
+      PrimExpr cond = floormod(expr, factor_expr) == make_zero(expr.dtype());
+      if (auto match = TryMatchLiteralConstraint(cond)) {
+        if (const int64_t* as_int = as_const_int(match.value())) {
+          return *as_int != 0;
+        }
+      }
+      return analyzer_->CanProve(cond);
+    };
+
+    auto eliminate_bounded_offset = [&](PrimExpr base, PrimExpr offset,
+                                        PrimExpr rhs) -> ffi::Optional<PrimExpr> {
+      ConstIntBound offset_bound = analyzer_->const_int_bound(offset);
+      if (!offset_bound.defined()) return std::nullopt;
+      if (offset_bound->min_value < 0) return std::nullopt;
+
+      auto base_mod = analyzer_->modular_set(base);
+      auto rhs_mod = analyzer_->modular_set(rhs);
+
+      int64_t base_gcd = ZeroAwareGCD(base_mod->base, base_mod->coeff);
+      int64_t rhs_gcd = ZeroAwareGCD(rhs_mod->base, rhs_mod->coeff);
+
+      // Prefer the largest factor known from modular analysis of both sides.
+      // If rhs modular information isn't available (e.g. constraints nested in
+      // `and` aren't propagated to ModularSetAnalyzer), fall back to the
+      // factor known from the base expression and use literal-constraint
+      // matching to prove rhs alignment.
+      int64_t common_factor = ZeroAwareGCD(base_gcd, rhs_gcd);
+      int64_t factor = common_factor > 1 ? common_factor : base_gcd;
+      if (factor <= 1) return std::nullopt;
+
+      if (offset_bound->max_value >= factor) return std::nullopt;
+      if (!is_multiple_of(rhs, rhs_gcd, factor)) return std::nullopt;
+
+      return RecursiveRewrite(base < rhs);
+    };
+
+    if (const auto* add = ret->a.as<AddNode>()) {
+      if (auto simplified =
+              eliminate_bounded_offset(add->a, add->b, ret->b)) {
+        return simplified.value();
+      }
+      if (auto simplified =
+              eliminate_bounded_offset(add->b, add->a, ret->b)) {
+        return simplified.value();
+      }
+    }
+
+    // If `lhs` and `base` are multiples of k, then the comparison
+    //   lhs < base + offset
+    // can sometimes be simplified depending on the bounds of `offset`.
+    //
+    // Example:
+    //   z < x * 4 + y  ==>  z <= x * 4
+    // when 1 <= y < 4 and z % 4 == 0.
+    auto eliminate_bounded_offset_rhs =
+        [&](PrimExpr lhs, PrimExpr base, PrimExpr offset) -> ffi::Optional<PrimExpr> {
+      ConstIntBound offset_bound = analyzer_->const_int_bound(offset);
+      if (!offset_bound.defined()) return std::nullopt;
+      if (offset_bound->min_value < 0) return std::nullopt;
+
+      auto base_mod = analyzer_->modular_set(base);
+      auto lhs_mod = analyzer_->modular_set(lhs);
+
+      int64_t base_gcd = ZeroAwareGCD(base_mod->base, base_mod->coeff);
+      int64_t lhs_gcd = ZeroAwareGCD(lhs_mod->base, lhs_mod->coeff);
+
+      int64_t common_factor = ZeroAwareGCD(base_gcd, lhs_gcd);
+      int64_t factor = common_factor > 1 ? common_factor : base_gcd;
+      if (factor <= 1) return std::nullopt;
+
+      if (offset_bound->max_value >= factor) return std::nullopt;
+      if (!is_multiple_of(lhs, lhs_gcd, factor)) return std::nullopt;
+
+      if (offset_bound->min_value > 0) {
+        return RecursiveRewrite(lhs <= base);
+      }
+      if (offset_bound->min_value == 0 && offset_bound->max_value == 0) {
+        return RecursiveRewrite(lhs < base);
+      }
+      return std::nullopt;
+    };
+
+    if (const auto* add = ret->b.as<AddNode>()) {
+      if (auto simplified = eliminate_bounded_offset_rhs(ret->a, add->a, add->b)) {
+        return simplified.value();
+      }
+      if (auto simplified = eliminate_bounded_offset_rhs(ret->a, add->b, add->a)) {
+        return simplified.value();
+      }
+    }
+
     auto merge_constants = [&]() -> ffi::Optional<PrimExpr> {
       auto [lhs, lhs_offset] = ExtractConstantOffset(ret->a);
       auto [rhs, rhs_offset] = ExtractConstantOffset(ret->b);
@@ -1975,6 +2079,16 @@ PrimExpr RewriteSimplifier::Impl::ApplyRewriteRules(LT ret) {
       return RecursiveRewrite(merge_constants.value());
     }
 
+    auto contains_floordiv = [](const PrimExpr& expr) -> bool {
+      bool found = false;
+      PostOrderVisit(expr, [&found](const ObjectRef& obj) {
+        if (obj.as<FloorDivNode>()) {
+          found = true;
+        }
+      });
+      return found;
+    };
+
     auto common_factor = [&]() -> int64_t {
       auto modular_a = analyzer_->modular_set(ret->a);
       auto modular_b = analyzer_->modular_set(ret->b);
@@ -1983,7 +2097,15 @@ PrimExpr RewriteSimplifier::Impl::ApplyRewriteRules(LT ret) {
       return ZeroAwareGCD(gcd_lhs, gcd_rhs);
     }();
     if (common_factor > 1) {
-      return RecursiveRewrite(floordiv(ret->a, common_factor) < floordiv(ret->b, common_factor));
+      PrimExpr lhs = VisitExpr(floordiv(ret->a, common_factor));
+      PrimExpr rhs = VisitExpr(floordiv(ret->b, common_factor));
+
+      // Don't introduce floordiv in the comparison if it cannot be
+      // eliminated after simplification.  Keeping `x * k < N` can be
+      // preferable to rewriting to `x < N // k` even when `N % k == 0`.
+      if (!contains_floordiv(lhs) && !contains_floordiv(rhs)) {
+        return RecursiveRewrite(lhs < rhs);
+      }
     }
   }
   return ret;

@@ -208,12 +208,13 @@ void BlockReadWriteDetector::VisitExpr_(const CallNode* op) {
         for (const Range& range : region) {
           int_set.push_back(arith::EvalSet(range, dom_map_));
         }
-        // read access, write access or opaque access
-        if ((access_mask->value & 1) && (access_mask->value & 2)) {
-          Update(&opaque_buffers_, &opaque_regions_, buffer, int_set);
-        } else if (access_mask->value & 1) {
+        // Conservatively treat rw_mask as the union of reads and writes.
+        // This avoids forcing TVM Script users to manually annotate access
+        // regions for common patterns (e.g., atomic read-modify-write).
+        if (access_mask->value & 1) {
           Update(&read_buffers_, &read_regions_, buffer, int_set);
-        } else if (access_mask->value & 2) {
+        }
+        if (access_mask->value & 2) {
           Update(&writes_buffers_, &write_regions_, buffer, int_set);
         }
       }

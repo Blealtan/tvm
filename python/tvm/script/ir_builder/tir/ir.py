@@ -1578,6 +1578,12 @@ if TYPE_CHECKING:
     class float4_e2m1fnx32: ...
     class float4_e2m1fnx64: ...
     class bfloat16: ...
+    class bfloat16x2: ...
+    class bfloat16x4: ...
+    class bfloat16x8: ...
+    class bfloat16x16: ...
+    class bfloat16x32: ...
+    class bfloat16x64: ...
 else:
     # pylint: disable=invalid-name
     int8 = func_gen(("Int8"))
@@ -1744,6 +1750,12 @@ else:
     float4_e2m1fnx64 = func_gen(("Float4E2M1FNx64"))
 
     bfloat16 = func_gen(("BFloat16"))
+    bfloat16x2 = func_gen(("BFloat16x2"))
+    bfloat16x4 = func_gen(("BFloat16x4"))
+    bfloat16x8 = func_gen(("BFloat16x8"))
+    bfloat16x16 = func_gen(("BFloat16x16"))
+    bfloat16x32 = func_gen(("BFloat16x32"))
+    bfloat16x64 = func_gen(("BFloat16x64"))
     # pylint: enable=invalid-name
 
 
@@ -2319,6 +2331,12 @@ __all__ = float_types + [
     "uint32x64",
     "uint64x64",
     "bfloat16",
+    "bfloat16x2",
+    "bfloat16x4",
+    "bfloat16x8",
+    "bfloat16x16",
+    "bfloat16x32",
+    "bfloat16x64",
     "buffer",
     "buffer_decl",
     "prim_func",
